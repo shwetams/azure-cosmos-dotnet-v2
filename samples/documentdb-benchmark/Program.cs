@@ -13,6 +13,7 @@
     using Microsoft.Azure.Documents;
     using Microsoft.Azure.Documents.Client;
     using Newtonsoft.Json;
+    using System.IO;
 
     /// <summary>
     /// This sample demonstrates how to achieve high performance writes using DocumentDB.
@@ -42,6 +43,9 @@
         private int pendingTaskCount;
         private long documentsInserted;
         private ConcurrentDictionary<int, double> requestUnitsConsumed = new ConcurrentDictionary<int, double>();
+        private ConcurrentDictionary<int, double> requestLatencyInSecs = new ConcurrentDictionary<int, double>();
+        private ConcurrentDictionary<int, string> requestResponseString = new ConcurrentDictionary<int, string>();
+
         private DocumentClient client;
 
         /// <summary>
@@ -166,7 +170,8 @@
             }
 
             await Task.WhenAll(tasks);
-
+            // Write everything into files
+            
             if (bool.Parse(ConfigurationManager.AppSettings["ShouldCleanupOnFinish"]))
             {
                 Console.WriteLine("Deleting Database {0}", DatabaseName);
@@ -177,9 +182,12 @@
         private async Task InsertDocument(int taskId, DocumentClient client, DocumentCollection collection, string sampleJson, long numberOfDocumentsToInsert)
         {
             requestUnitsConsumed[taskId] = 0;
+            requestLatencyInSecs[taskId] = 0;
             string partitionKeyProperty = collection.PartitionKey.Paths[0].Replace("/", "");
             Dictionary<string, object> newDictionary = JsonConvert.DeserializeObject<Dictionary<string, object>>(sampleJson);
-
+            TextWriter tw = new StreamWriter(@"c:\repos\Logs_01.txt");
+          
+           
             for (var i = 0; i < numberOfDocumentsToInsert; i++)
             {
                 newDictionary["id"] = Guid.NewGuid().ToString();
@@ -193,7 +201,13 @@
                             new RequestOptions() { });
 
                     string partition = response.SessionToken.Split(':')[0];
+                   
                     requestUnitsConsumed[taskId] += response.RequestCharge;
+                    requestLatencyInSecs[taskId] += response.RequestLatency.TotalMilliseconds;
+                    
+                    requestResponseString[taskId] = response.RequestDiagnosticsString;
+                    string lineToWrite = taskId + "," + requestUnitsConsumed[taskId] + "," + requestLatencyInSecs[taskId] + "," + requestResponseString[taskId];
+                    tw.WriteLine(lineToWrite);
                     Interlocked.Increment(ref this.documentsInserted);
                 }
                 catch (Exception e)
@@ -211,8 +225,9 @@
                         }
                     }
                 }
+                
             }
-
+            tw.Close();
             Interlocked.Decrement(ref this.pendingTaskCount);
         }
 
@@ -224,7 +239,8 @@
             double requestUnits = 0;
             double ruPerSecond = 0;
             double ruPerMonth = 0;
-
+            double avg_latencySec = 0;
+            var cnt = 0;
             Stopwatch watch = new Stopwatch();
             watch.Start();
 
@@ -238,16 +254,24 @@
                 {
                     requestUnits += requestUnitsConsumed[taskId];
                 }
+              
+                foreach(int taskId in requestLatencyInSecs.Keys)
+                {
+                    avg_latencySec += requestLatencyInSecs[taskId];
+                    cnt += 1;
+                }
+                
+                avg_latencySec = avg_latencySec / cnt;
 
                 long currentCount = this.documentsInserted;
                 ruPerSecond = (requestUnits / seconds);
                 ruPerMonth = ruPerSecond * 86400 * 30;
 
-                Console.WriteLine("Inserted {0} docs @ {1} writes/s, {2} RU/s ({3}B max monthly 1KB reads)",
+                Console.WriteLine("Inserted {0} docs @ {1} writes/s, {2} RU/s ({3}B max monthly 1KB reads), {4} Average Latency in Milli Seconds",
                     currentCount,
                     Math.Round(this.documentsInserted / seconds),
                     Math.Round(ruPerSecond),
-                    Math.Round(ruPerMonth / (1000 * 1000 * 1000)));
+                    Math.Round(ruPerMonth / (1000 * 1000 * 1000)),avg_latencySec);
 
                 lastCount = documentsInserted;
                 lastSeconds = seconds;
@@ -287,7 +311,7 @@
             Console.WriteLine("The collection will cost an estimated ${0} per hour (${1} per month)", Math.Round(estimatedCostPerHour, 2), Math.Round(estimatedCostPerMonth, 2));
             Console.WriteLine("Press enter to continue ...");
             Console.ReadLine();
-
+           
             return await client.CreateDocumentCollectionAsync(
                     UriFactory.CreateDatabaseUri(databaseName), 
                     collection, 
